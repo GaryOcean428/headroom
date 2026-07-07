@@ -128,46 +128,96 @@ def _strip_cache_control(obj: Any) -> Any:
     return obj
 
 
+# Keys that carry NO semantic payload for the model — transport / caching-directive
+# / telemetry / client-routing annotations that clients attach and vary turn-to-turn.
+# Grounded in provider API docs (Anthropic Messages, OpenAI Chat+Responses, Bedrock
+# Converse) + client-library field inventories (litellm, Vercel AI SDK, opencode,
+# Claude Code, Cline). Dropped from the cross-turn prefix-equality key ONLY.
+#
+# NOTE ON SAFETY: this projection is a COMPARISON KEY, never a source to rebuild
+# forwarded bytes — the cache-stable-delta path always forwards the previously
+# forwarded bytes + the raw appended delta. So dropping these can't deprive the
+# model. What we must NOT do is drop a *semantic* field (that would mask a real
+# divergence and replay a stale prefix), which is why: (1) reasoning SIGNATURES are
+# NOT in this set (Anthropic 400s if a thinking block is altered/missing, and a
+# present/absent flip is a real divergence we want to detect); (2) tool inputs /
+# arguments / json payloads are treated as OPAQUE and compared verbatim (see
+# _OPAQUE_PAYLOAD_KEYS) so a user key that happens to be named "index"/"state" is
+# never stripped from inside a tool call.
+_NON_SEMANTIC_KEYS = frozenset(
+    {
+        # cache-breakpoint markers (moved to the newest block every turn)
+        "cache_control",  # Anthropic (per-block)
+        "cachePoint",  # Bedrock (per-block content block)
+        # litellm unified-message / tool annotations
+        "caller",  # litellm programmatic-tool tag on tool_use
+        "provider_specific_fields",
+        "reasoning_content",  # litellm display echo (the paired signature is separate)
+        "reasoning_items",
+        "annotations",  # citation/display metadata
+        # OpenAI response echoes that can ride on assistant messages
+        "system_fingerprint",
+        "service_tier",
+        # Vercel AI SDK / opencode part transport
+        "providerMetadata",
+        "providerOptions",
+        "callProviderMetadata",
+        "state",
+        "providerExecuted",
+        "synthetic",
+        "ignored",
+        # streaming-assembly artifact
+        "index",
+    }
+)
+
+# Values under these keys are opaque semantic payloads (tool-call input, OpenAI
+# stringified arguments, Bedrock tool_result json). They are compared VERBATIM — we
+# never recurse into them to strip "noise" keys, because arbitrary user data there
+# may legitimately contain keys that collide with _NON_SEMANTIC_KEYS (e.g. an
+# `input` of {"state": "CA", "index": 3}). Recursing would corrupt the comparison.
+_OPAQUE_PAYLOAD_KEYS = frozenset({"input", "arguments", "json"})
+
+
 def _canonicalize_for_prefix_compare(obj: Any) -> Any:
     """Representation-agnostic canonical form for cross-turn prefix equality.
 
-    Anthropic accepts several *equivalent* encodings for the same message, and
-    real clients vary them turn-to-turn. A raw-dict prefix compare then fails
-    spuriously and drops cache mode to raw (uncompressed) forwarding. The two
-    observed shape variances:
+    Providers accept several *equivalent* encodings for the same message, and real
+    clients vary them turn-to-turn; a raw-dict prefix compare then fails spuriously
+    and drops cache mode to raw (uncompressed) forwarding. This normalizes ONLY
+    representation:
+      * drops non-semantic annotation / cache-directive / telemetry keys
+        (_NON_SEMANTIC_KEYS) at any message/block level;
+      * wraps a bare string ``content`` into ``[{"type": "text", "text": ...}]``
+        (Anthropic's string sugar, which litellm flips per turn);
+      * leaves tool ``input`` / ``arguments`` / ``json`` payloads verbatim
+        (_OPAQUE_PAYLOAD_KEYS) so user data is never corrupted;
+      * KEEPS all real content (text, tool name/input, tool_result content, reasoning
+        signatures, ids) so two messages canonicalize-equal iff they are semantically
+        identical.
 
-      * ``cache_control`` is moved to the newest message every turn (clients like
-        litellm / Claude Code mark only the latest block).
-      * ``content`` may be a bare string OR ``[{"type": "text", "text": ...}]``.
-        litellm resends tool_result / text content as a plain string while the
-        stored ``previous_original`` holds the block-list form (or vice-versa),
-        so the very first tool_result mismatches on shape every turn.
-      * client-only annotation keys (e.g. ``caller`` on a ``tool_use`` block, a
-        mini-swe-agent / litellm routing tag) appear on the stored copy but not on
-        the re-sent wire message (or vice-versa), mismatching every assistant turn.
-
-    This normalizes ONLY representation: it drops non-semantic annotation keys and
-    wraps any string ``content`` into a single text block. It never drops, reorders,
-    or merges actual message text / tool inputs, so two messages canonicalize-equal
-    iff their semantic content is identical -- safe to then replay the
-    previously-forwarded (provider-cached) bytes.
+    Used ONLY as a comparison key for the cache-stable delta path; the original,
+    unmodified messages are always what gets forwarded.
     """
-    # Keys that carry no semantic payload for the model — they are transport /
-    # caching / client-routing annotations that clients vary between turns. They
-    # must be ignored when deciding whether this turn append-only-extends the last.
-    _NON_SEMANTIC_KEYS = ("cache_control", "caller")
     if isinstance(obj, dict):
         out: dict[str, Any] = {}
         for key, value in obj.items():
             if key in _NON_SEMANTIC_KEYS:
                 continue
-            if key == "content" and isinstance(value, str):
+            if key in _OPAQUE_PAYLOAD_KEYS:
+                out[key] = value  # verbatim — do not recurse into user payloads
+            elif key == "content" and isinstance(value, str):
                 out[key] = [{"type": "text", "text": value}]
             else:
                 out[key] = _canonicalize_for_prefix_compare(value)
         return out
     if isinstance(obj, list):
-        return [_canonicalize_for_prefix_compare(value) for value in obj]
+        canon = [_canonicalize_for_prefix_compare(value) for value in obj]
+        # Drop blocks that projected to {} — a pure cache-directive content block
+        # (e.g. Bedrock {"cachePoint": {...}}) whose only key was non-semantic. Left
+        # in place it would be an empty-dict entry, so a directive block moving
+        # position across turns would spuriously fail the length/order compare.
+        return [value for value in canon if value != {}]
     return obj
 
 
