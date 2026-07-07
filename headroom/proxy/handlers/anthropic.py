@@ -321,56 +321,19 @@ class AnthropicHandlerMixin:
         current original request. This lets us replay the exact forwarded bytes
         for historical context and only transform newly appended message suffixes.
 
-        The prefix equality check ignores ``cache_control``: clients (litellm,
-        Claude Code) move the ephemeral cache breakpoint to the newest message
-        on every turn, so a historical message carries the marker on one turn and
-        not the next. Comparing raw dicts makes that per-call annotation fail the
-        prefix match, dropping cache mode to raw (uncompressed) forwarding every
-        turn -- byte-stable but 0% compression (observed: avg_compression_pct=0.0
-        on the mini-swe-agent cache-mode run). The marker never changes message
-        *content*, so stripping it for the compare lets the delta path engage:
-        replay the byte-identical cached prefix AND compress only the appended
-        delta. Mirrors the guard already used by ``overlay_cached_prefix``.
+        The append-only check ignores per-turn transport / cache-directive / client
+        annotation noise (cache_control moved to the newest block, litellm caller,
+        provider_specific_fields, streaming index, string<->block content shape, …) via
+        the shared canonicalizer, so that churn doesn't spuriously drop cache mode to raw
+        forwarding. Delegates to the provider-agnostic engine in prefix_tracker so
+        OpenAI / Bedrock share one implementation.
         """
-        from headroom.cache.prefix_tracker import _canonicalize_for_prefix_compare
-        import sys as _sys
+        from headroom.cache.prefix_tracker import extract_cache_stable_delta
 
-        def _diag(msg: str) -> None:  # TEMP delta-path diagnostics -> proxy.log
-            print(f"[DELTA-DIAG] {msg}", file=_sys.stderr, flush=True)
-
-        if not previous_original_messages or previous_forwarded_messages is None:
-            _diag(
-                f"None:cold prev_orig={bool(previous_original_messages)} "
-                f"prev_fwd={previous_forwarded_messages is not None}"
-            )
-            return None
-        prefix_len = len(previous_original_messages)
-        if len(current_messages) < prefix_len:
-            _diag(f"None:shorter cur={len(current_messages)} < prefix_len={prefix_len}")
-            return None
-        _cs = _canonicalize_for_prefix_compare(current_messages[:prefix_len])
-        _ps = _canonicalize_for_prefix_compare(previous_original_messages)
-        if _cs != _ps:
-            _di = next((k for k in range(min(len(_cs), len(_ps))) if _cs[k] != _ps[k]), -1)
-            if _di >= 0:
-                _c, _p = _cs[_di], _ps[_di]
-                _ck = sorted(_c.keys()) if isinstance(_c, dict) else str(type(_c))
-                _pk = sorted(_p.keys()) if isinstance(_p, dict) else str(type(_p))
-                _diag(
-                    f"None:MISMATCH idx={_di}/{prefix_len} "
-                    f"cur_role={_c.get('role') if isinstance(_c, dict) else '?'} "
-                    f"prv_role={_p.get('role') if isinstance(_p, dict) else '?'} "
-                    f"cur_keys={_ck} prv_keys={_pk}"
-                )
-                _diag(f"  cur[{_di}]={repr(_c)[:500]}")
-                _diag(f"  prv[{_di}]={repr(_p)[:500]}")
-            else:
-                _diag(f"None:length-only cur_len={len(_cs)} prv_len={len(_ps)}")
-            return None
-        _diag(f"ENGAGED prefix_len={prefix_len} delta={len(current_messages) - prefix_len}")
-        return (
-            copy.deepcopy(previous_forwarded_messages),
-            copy.deepcopy(current_messages[prefix_len:]),
+        return extract_cache_stable_delta(
+            current_messages,
+            previous_original_messages,
+            previous_forwarded_messages,
         )
 
     @staticmethod

@@ -221,6 +221,41 @@ def _canonicalize_for_prefix_compare(obj: Any) -> Any:
     return obj
 
 
+def extract_cache_stable_delta(
+    current_messages: list[dict[str, Any]],
+    previous_original_messages: list[dict[str, Any]] | None,
+    previous_forwarded_messages: list[dict[str, Any]] | None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]] | None:
+    """Return ``(stable_forwarded_prefix, appended_delta_messages)`` when the current
+    request append-only-extends the previous one, else ``None``.
+
+    Provider-agnostic delta engine for cache mode. "Append-only" is decided by comparing
+    the *canonicalized* prefix (:func:`_canonicalize_for_prefix_compare`, which ignores
+    per-turn transport / cache-directive / client-annotation noise across
+    Anthropic / OpenAI / Bedrock and the common clients), so a moved cache marker or
+    shape churn does not spuriously collapse cache mode to raw forwarding. On a match the
+    caller replays the byte-identical previously-forwarded prefix and compresses ONLY the
+    appended delta.
+
+    This is a COMPARISON + slice only: the returned prefix is the previously-forwarded
+    bytes verbatim and the delta is the raw appended messages — never a rebuild from the
+    canonical projection — so the projection dropping non-semantic fields is safe.
+    """
+    if not previous_original_messages or previous_forwarded_messages is None:
+        return None
+    prefix_len = len(previous_original_messages)
+    if len(current_messages) < prefix_len:
+        return None
+    if _canonicalize_for_prefix_compare(
+        current_messages[:prefix_len]
+    ) != _canonicalize_for_prefix_compare(previous_original_messages):
+        return None
+    return (
+        copy.deepcopy(previous_forwarded_messages),
+        copy.deepcopy(current_messages[prefix_len:]),
+    )
+
+
 def overlay_cached_prefix(
     optimized_messages: list[dict[str, Any]],
     current_original_messages: list[dict[str, Any]],
