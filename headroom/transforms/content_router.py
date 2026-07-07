@@ -2943,8 +2943,13 @@ class ContentRouter(Transform):
             if msg.get("role") != "assistant":
                 continue
 
-            # OpenAI format: tool_calls array
-            for tc in msg.get("tool_calls", []):
+            # OpenAI format: tool_calls array. Coalesce None -> [] : OpenAI/LiteLLM
+            # assistant messages carry an explicit ``tool_calls: null`` (and
+            # ``function_call: null``) when there are no calls, so ``.get(k, [])``
+            # returns None (not []) and iterating it crashes _build_tool_name_map ->
+            # apply() -> compression silently falls through to passthrough on every
+            # OpenAI turn. This is the generic OpenAI-shape fix.
+            for tc in (msg.get("tool_calls") or []):
                 if isinstance(tc, dict):
                     tc_id = tc.get("id", "")
                     fn = tc.get("function", {})

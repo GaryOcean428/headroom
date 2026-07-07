@@ -271,6 +271,26 @@ def test_bugA_strip_cd_prefix_shapes():
     assert _stripcd("") == "" and _stripcd(None) == ""  # defensive
 
 
+def test_openai_tool_calls_none_does_not_crash_and_still_compresses():
+    # OpenAI/LiteLLM assistant messages carry an explicit `tool_calls: None` (and
+    # `function_call: None`) when there are no calls. `msg.get("tool_calls", [])`
+    # returns None (not []), so iterating it crashed _build_tool_name_map ->
+    # apply() -> compression silently fell through to PASSTHROUGH on every OpenAI
+    # turn (observed on GPT-5.4 text-based: only ~2/24 requests compressed, net
+    # token inflation). This asserts the coalesce fix: no crash, map builds.
+    from headroom.transforms.content_router import ContentRouter, ContentRouterConfig
+    cr = ContentRouter(ContentRouterConfig())
+    msgs = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "task"},
+        {"role": "assistant", "content": "THOUGHT: look\n```bash\ncd /r && cat x.py\n```",
+         "tool_calls": None, "function_call": None},              # <- the OpenAI shape
+        {"role": "user", "content": "<returncode>0</returncode>\n<output>\n" + "x\n" * 200 + "</output>"},
+    ]
+    name_map = cr._build_tool_name_map(msgs)   # must not raise
+    assert isinstance(name_map, dict)
+
+
 def test_bugB_read_detection_across_tool_call_wire_shapes():
     # The SAME read action, as each provider/harness serializes its tool call.
     # _tool_call_command_text must recover the shell command from all of them so
