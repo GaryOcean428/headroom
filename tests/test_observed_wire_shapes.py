@@ -211,3 +211,19 @@ def test_ext_aisdk_provider_metadata_and_state_ignored():
 #   * a tool-shape compression test (OpenAI role:tool with tool safeguards; Bedrock
 #     toolResult json). These live in the content_router tests once fix-7 is generalized
 #     beyond the Anthropic tool_result block path.
+
+
+# ============================================================================
+# Section 4 — read protection (HEADROOM_PROTECT_READS): never lossy-compress reads
+# ============================================================================
+from headroom.transforms.content_router import _is_read_command as _isread
+
+
+def test_read_command_classifier():
+    reads = ["cat foo.py", "cat -n foo.py", "cd /x && cat a.py", "cd /x && cat -A a.py | head -60",
+             "sed -n '1,50p' f.py", "head -100 f.py", "tail -20 log", "nl f.py"]
+    non = ["cat > f.py <<'EOF'\nx\nEOF", "cat a >> b", "echo x | tee f", "sed -i 's/a/b/' f",
+           "sed 's/a/b/' f", "rg -l x --type py", "grep -rn x .", "ls -la", "python -c 'x'",
+           "git diff -- f", "swebench-pytest-lite t/", "", None]
+    assert all(_isread(c) for c in reads), [c for c in reads if not _isread(c)]
+    assert not any(_isread(c) for c in non), [c for c in non if _isread(c)]

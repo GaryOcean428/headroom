@@ -113,6 +113,45 @@ def _tool_call_command_text(raw: Any) -> str:
     return cmd if isinstance(cmd, str) else ""
 
 
+_READ_VERBS = ("cat", "head", "tail", "nl", "bat", "less", "more")
+
+
+def _is_read_command(command: str) -> bool:
+    """True when a shell command's output is essentially raw FILE CONTENT the agent
+    will read/edit from — ``cat``/``head``/``tail``/``nl``/``less``/``more`` of a file,
+    or ``sed -n`` range-printing.
+
+    Such reads must NOT be lossy-compressed: the agent needs the exact bytes to produce
+    a precise patch. Lossy-compressing them was observed (SWE-bench, mini-swe-agent) to
+    cause the agent to RE-READ the same file (cat -> cat -A -> cat -n) to recover exact
+    detail — turn inflation — and, when recovery failed, resolve loss. Search/list/test
+    output (grep/rg/ls/find/pytest) is derived and stays compressible.
+
+    Excludes writes: a redirect (``>``/``>>``), ``tee``, or heredoc (``<<``) means the
+    command WRITES a file (e.g. ``cat > f <<EOF``), and a bare ``sed`` (without ``-n``)
+    is a stream edit — neither is a read.
+    """
+    if not command or not isinstance(command, str):
+        return False
+    c = command.strip()
+    # strip leading `cd <dir> && ` chains (agents prefix reads with a cd)
+    while True:
+        m = re.match(r"^cd\s+[^&;|]+&&\s*(.*)$", c, re.S)
+        if not m:
+            break
+        c = m.group(1).strip()
+    # a write / append / tee / heredoc anywhere => not a pure read
+    if re.search(r"(^|\s)(>>?|tee\b|<<)", c):
+        return False
+    first = (c.split() or [""])[0]
+    if first in _READ_VERBS:
+        return True
+    if first == "sed":
+        # `sed -n '1,20p' file` prints a range (read); bare `sed` is a stream editor.
+        return bool(re.search(r"(^|\s)-n(\s|$)", c))
+    return False
+
+
 # Shell wrappers that prefix the real program — peeled to find it. Shell
 # grammar, not tunable policy: rtk (the user's token proxy), sudo/env/timeout/…
 _SHELL_WRAPPERS = frozenset(
@@ -3157,6 +3196,26 @@ class ContentRouter(Transform):
             if is_tool_excluded(name, exclude_tools)
         }
 
+        # Read protection (HEADROOM_PROTECT_READS=1): for bash-family agents the
+        # exclude-by-tool-NAME set above never catches file reads (they are `bash`
+        # tool calls whose COMMAND is a cat/sed/head/...). Mark those tool_use_ids so
+        # their output is never LOSSY-compressed (the agent needs exact bytes to edit;
+        # lossy reads caused re-reads/turn-inflation + resolve loss on SWE-bench).
+        # Type-specific by design: grep/test/ls output stays compressible, so the
+        # cache-mode delta still compresses whenever the newest turn is NOT a read.
+        self._protect_read_tool_ids = set()
+        if os.environ.get("HEADROOM_PROTECT_READS", "0").strip().lower() not in (
+            "0",
+            "",
+            "false",
+            "no",
+        ):
+            self._protect_read_tool_ids = {
+                tid
+                for tid in tool_name_map
+                if _is_read_command(self._tool_call_args.get(tid, ""))
+            }
+
         # --- Adaptive parameters based on context pressure ---
         num_messages = len(messages)
         model_limit = kwargs.get("model_limit", 0)
@@ -4016,6 +4075,17 @@ class ContentRouter(Transform):
             if block_type == "tool_result":
                 # Check if tool is excluded from compression
                 tool_use_id = block.get("tool_use_id", "")
+                # Read protection (HEADROOM_PROTECT_READS): never LOSSY-compress a file
+                # read (cat/sed/head/...) — pass it through verbatim so the agent keeps
+                # the exact bytes to edit from. Applies regardless of recency (unlike the
+                # windowed excluded-tool path below); cross-turn dedup still runs later,
+                # so re-reads of the same file are still losslessly de-duplicated.
+                if tool_use_id in getattr(self, "_protect_read_tool_ids", ()):
+                    new_blocks.append(block)
+                    if route_counts is not None:
+                        route_counts.setdefault("read_protected", 0)
+                        route_counts["read_protected"] += 1
+                    continue
                 if tool_use_id in excluded_tool_ids:
                     if messages_from_end <= read_protection_window:
                         # Protected from lossy compression — but grep/log/json
