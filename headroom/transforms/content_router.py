@@ -3802,6 +3802,19 @@ class ContentRouter(Transform):
                 ", ".join(parts),
             )
 
+        # Per-request routing visibility (grep `[router] route_counts`): how many
+        # messages/blocks hit each route this request — skip reasons (small,
+        # user_msg, non_string, recent_code, analysis_ctx, content_blocks,
+        # excluded_tool, read_protected, error_protected, already_compressed, …)
+        # plus successful compressions. Makes "what is Headroom missing?" answerable
+        # per provider shape (e.g. OpenAI plain-string user obs vs Anthropic
+        # tool_result blocks) directly from a run's logs. INFO so it's on by default.
+        _nonzero = {k: v for k, v in route_counts.items() if v}
+        logger.info(
+            "[router] route_counts=%s compressed=%d frozen=%d msgs=%d",
+            _nonzero, len(compressed_details), frozen_message_count, num_messages,
+        )
+
         # Forward route_counts to the observer so `/stats` can surface a
         # session-level protection breakdown (issue #454). The observer
         # may not implement this method on older versions; ignore
