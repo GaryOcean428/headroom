@@ -1,0 +1,213 @@
+"""Cache-mode delta engagement against REAL observed wire shapes + extension scaffolding.
+
+Section 1 pins the exact message shapes we observed on the wire during the SWE-bench
+mini-swe-agent + litellm -> Anthropic run (captured via the proxy's per-turn DELTA-DIAG):
+these are the shapes that broke the naive prefix compare and that fix-4..7 + the
+generalized canonicalizer now handle. They are our validated path and MUST stay green.
+
+Section 2 is EXTENSION-READY coverage for provider/client shapes we researched (OpenAI
+Chat + Responses, Bedrock Converse, Vercel-AI-SDK/opencode) but have NOT yet exercised
+end-to-end. The shared canonicalizer is provider-agnostic, so these already pass at the
+*comparison* layer; the comments mark what additional *handler* wiring each provider
+still needs for full delta-only compression (see the per-provider TODOs).
+
+Everything here is comparison-layer only (no Modal / no provider calls).
+"""
+import copy
+
+from headroom.cache.prefix_tracker import (
+    _canonicalize_for_prefix_compare as CANON,
+    extract_cache_stable_delta as delta,
+)
+
+
+def _eq(a, b):
+    return CANON(a) == CANON(b)
+
+
+# ============================================================================
+# Section 1 — OBSERVED: mini-swe-agent + litellm -> Anthropic wire (validated)
+# ============================================================================
+# Real shapes from the run's DELTA-DIAG. mini emits a bash action; litellm converts
+# the OpenAI-ish history to Anthropic blocks on the wire, and (turn-to-turn) it:
+#   (a) moves the ephemeral cache_control marker to the newest block,
+#   (b) attaches `caller: {type: direct}` to tool_use on the stored copy,
+#   (c) flips tool_result.content between a bare string and [{type:text,text}],
+# while the observation payload itself (`<returncode>N</returncode>\n<output>…</output>`)
+# is unchanged. All three must be ignored by the prefix compare.
+
+_RC = "<returncode>0</returncode>\n<output>\n./suma/apps/foo.py\n</output>"  # real observation form
+
+
+def _asst_tooluse(with_caller: bool, cc: bool):
+    tu = {"type": "tool_use", "id": "toolu_01ABC", "name": "bash",
+          "input": {"command": 'cd /tmp/core && rg -l "safe_math" --type py | head'}}
+    if with_caller:
+        tu["caller"] = {"type": "direct"}  # litellm programmatic-tool tag
+    if cc:
+        tu["cache_control"] = {"type": "ephemeral"}
+    return {"role": "assistant", "content": [tu]}
+
+
+def _tool_result(as_string: bool, cc: bool):
+    content = _RC if as_string else [{"type": "text", "text": _RC}]
+    block = {"type": "tool_result", "tool_use_id": "toolu_01ABC", "content": content}
+    if cc:
+        block["cache_control"] = {"type": "ephemeral"}
+    return {"role": "user", "content": [block]}
+
+
+def test_observed_caller_present_vs_absent_ignored():
+    assert _eq(_asst_tooluse(with_caller=True, cc=False),
+               _asst_tooluse(with_caller=False, cc=False))
+
+
+def test_observed_tool_result_string_vs_block_ignored():
+    assert _eq(_tool_result(as_string=True, cc=False),
+               _tool_result(as_string=False, cc=False))
+
+
+def test_observed_moved_cache_control_ignored():
+    # marker on tool_use one turn, on tool_result the next
+    assert _eq(_asst_tooluse(with_caller=True, cc=True),
+               _asst_tooluse(with_caller=True, cc=False))
+
+
+def test_observed_thinking_block_stable_signature():
+    # mini turns carry an Anthropic thinking block with a stable signature; unchanged
+    # across resend -> stays equal (and a signature change would be a real divergence).
+    th = lambda: {"role": "assistant", "content": [
+        {"type": "thinking", "thinking": "", "signature": "Eo4CCmMIDxgCKkD..."},
+        {"type": "text", "text": "Let me find the tool."},
+        {"type": "tool_use", "id": "toolu_01ABC", "name": "bash", "input": {"command": "ls"}},
+    ]}
+    assert _eq(th(), th())
+
+
+def test_observed_full_turn_delta_engages():
+    # The exact failure the run hit: prev stored the assistant with `caller` +
+    # cache_control on the newest block; this turn re-sends the same assistant WITHOUT
+    # caller, tool_result as a STRING, and the marker MOVED to the new observation.
+    # After fix-4..7 + generalized canon, the delta must engage (replay prefix + 1 delta).
+    prev_orig = [
+        {"role": "user", "content": [{"type": "text", "text": "task"}]},
+        _asst_tooluse(with_caller=True, cc=True),
+    ]
+    prev_fwd = copy.deepcopy(prev_orig)
+    cur = [
+        {"role": "user", "content": [{"type": "text", "text": "task"}]},
+        _asst_tooluse(with_caller=False, cc=False),
+        _tool_result(as_string=True, cc=True),
+    ]
+    out = delta(cur, prev_orig, prev_fwd)
+    assert out is not None, "observed litellm churn must NOT force raw fallback"
+    stable_prefix, appended = out
+    assert stable_prefix == prev_fwd            # replay the byte-identical cached prefix
+    assert len(appended) == 1                   # only the new tool_result is the delta
+
+
+def test_observed_genuine_command_change_still_diverges():
+    # Safety: a real change to the bash command must still fail the compare.
+    prev = [{"role": "assistant", "content": [
+        {"type": "tool_use", "id": "t", "name": "bash", "input": {"command": "ls"}}]}]
+    cur = [{"role": "assistant", "content": [
+        {"type": "tool_use", "id": "t", "name": "bash", "input": {"command": "rm -rf /"}}]}]
+    assert not _eq(prev[0], cur[0])
+
+
+# ============================================================================
+# Section 2 — EXTENSION-READY: researched shapes not yet exercised end-to-end
+# ============================================================================
+# The generalized canonicalizer is provider-agnostic, so these pass at the COMPARISON
+# layer today. Each block notes the additional HANDLER wiring still required for full
+# delta-only compression on that provider (tracked as follow-ups).
+
+# ---- OpenAI Chat Completions ------------------------------------------------
+# Tool result is a `role:"tool"` message with STRING content; assistant tool call is
+# `tool_calls[].function{name, arguments(JSON string)}`; automatic prefix caching (NO
+# cache_control marker). Noise seen on echoes: system_fingerprint/service_tier, and
+# streaming `index` on tool_calls.
+# EXTENSION TODO (handler): openai.py cache mode currently does overlay + frozen-count,
+# NOT delta-only compression. Wire it to extract_cache_stable_delta (marker policy = none).
+def test_ext_openai_tool_calls_index_and_fingerprint_ignored():
+    a = {"role": "assistant", "content": None, "tool_calls": [
+        {"id": "call_1", "type": "function", "index": 0,
+         "function": {"name": "bash", "arguments": '{"command":"ls"}'}}],
+        "system_fingerprint": "fp_a", "service_tier": "default"}
+    b = {"role": "assistant", "content": None, "tool_calls": [
+        {"id": "call_1", "type": "function",
+         "function": {"name": "bash", "arguments": '{"command":"ls"}'}}]}
+    assert _eq(a, b)
+    # but different arguments (opaque JSON string) must diverge
+    c = copy.deepcopy(b); c["tool_calls"][0]["function"]["arguments"] = '{"command":"pwd"}'
+    assert not _eq(b, c)
+
+
+# ---- OpenAI Responses API ---------------------------------------------------
+# function_call / function_call_output linked by call_id (not id); reasoning items carry
+# a VERBATIM `encrypted_content` that must round-trip. `summary` is display-only.
+# EXTENSION TODO (handler): same delta-path wiring as Chat; ensure reasoning items are
+# treated as content (encrypted_content kept in the identity — already is, generically).
+def test_ext_openai_responses_encrypted_content_is_the_semantic_carrier():
+    # The verbatim reasoning token is what matters: a change must diverge (never masked),
+    # identical must equate.
+    diff = {"role": "assistant", "content": [
+        {"type": "reasoning", "id": "rs_1", "encrypted_content": "ENC_DIFFERENT"}]}
+    base = {"role": "assistant", "content": [
+        {"type": "reasoning", "id": "rs_1", "encrypted_content": "ENC1"}]}
+    same = {"role": "assistant", "content": [
+        {"type": "reasoning", "id": "rs_1", "encrypted_content": "ENC1"}]}
+    assert not _eq(diff, base)
+    assert _eq(base, same)
+    # EXTENSION TODO: `summary` (display-only per OpenAI docs) and the reasoning item
+    # `id` are NOT yet in _NON_SEMANTIC_KEYS. If a client varies them per turn, the
+    # compare falls back to raw (safe: 0 compression, no stale replay). Add them to the
+    # deny-list when the OpenAI Responses delta path is wired and we've confirmed on a
+    # captured wire trace that they are non-load-bearing.
+
+
+# ---- Bedrock Converse -------------------------------------------------------
+# camelCase; toolUse/toolResult keyed (no `type`); toolResult.content allows {json}
+# (structured!) + a `status`; cachePoint is a standalone content block; reasoningContent
+# carries a verbatim signature.
+# EXTENSION TODO (handler): bedrock.py bypasses compression in cache mode. Wire a
+# cachePoint delta path (marker policy = strip/relocate cachePoint) to the shared engine.
+def test_ext_bedrock_cachepoint_ignored_json_and_status_kept():
+    a = {"role": "user", "content": [
+        {"toolResult": {"toolUseId": "tu1", "content": [{"json": {"ok": True, "n": 1}}], "status": "success"}},
+        {"cachePoint": {"type": "default"}}]}
+    b = {"role": "user", "content": [
+        {"toolResult": {"toolUseId": "tu1", "content": [{"json": {"ok": True, "n": 1}}], "status": "success"}}]}
+    assert _eq(a, b)                                    # cachePoint block dropped
+    c = copy.deepcopy(b); c["content"][0]["toolResult"]["content"][0]["json"]["n"] = 2
+    assert not _eq(b, c)                                # opaque json payload compared verbatim
+    d = copy.deepcopy(b); d["content"][0]["toolResult"]["status"] = "error"
+    assert not _eq(b, d)                                # status is semantic
+
+
+# ---- Vercel AI SDK / opencode ----------------------------------------------
+# Parts-based; reasoning signature lives in providerMetadata.anthropic.signature; parts
+# carry `state`/`providerExecuted`/`step-start` transport. NOTE: the proxy sees the
+# PROVIDER wire (post-AI-SDK-serialization), so providerMetadata typically does not reach
+# us — but we drop it defensively. EXTENSION TODO: if we ever ingest pre-wire AI-SDK
+# messages, ensure the signature is lifted from providerMetadata into the identity.
+def test_ext_aisdk_provider_metadata_and_state_ignored():
+    a = {"role": "assistant", "content": [
+        {"type": "text", "text": "ok", "state": "done",
+         "providerMetadata": {"anthropic": {"x": 1}}, "providerExecuted": True}]}
+    b = {"role": "assistant", "content": [{"type": "text", "text": "ok"}]}
+    assert _eq(a, b)
+
+
+# ============================================================================
+# Section 3 — EXTENSION HOOKS (documented, not yet implemented)
+# ============================================================================
+# When wiring a new provider to the shared delta engine, add here:
+#   * a per-provider marker policy test (Anthropic cache_control / Bedrock cachePoint
+#     stripped from the delta before compression; OpenAI: none);
+#   * a round-trip test that the forwarded prefix stays byte-identical across a real
+#     multi-turn fixture for that provider (byte-level; ideally sourced from a captured
+#     HEADROOM_LOG_MESSAGES trace of the `inspect` non-litellm harness);
+#   * a tool-shape compression test (OpenAI role:tool with tool safeguards; Bedrock
+#     toolResult json). These live in the content_router tests once fix-7 is generalized
+#     beyond the Anthropic tool_result block path.
