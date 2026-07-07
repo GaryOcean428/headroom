@@ -2086,6 +2086,31 @@ class ContentRouter(Transform):
                     compressor_name = "KompressCompressor"
                     decision_reason = "code_aware_unavailable_fallback_kompress"
                     strategy_chain.append(CompressionStrategy.KOMPRESS.value)
+                elif (
+                    self._lossless_then_lossy
+                    and compressed_tokens is not None
+                    and compressed_tokens >= original_tokens
+                ):
+                    # #3 — lossless-then-lossy: code-aware produced NO net shrink
+                    # and the lossless fold found nothing either, so this code
+                    # block would otherwise pass through uncompressed. Give the
+                    # lossy ML compressor (Kompress) a shot so lossy runs even when
+                    # lossless has no savings. Reads are protected upstream, so
+                    # only NON-read code reaches here. Keep Kompress ONLY if it
+                    # actually shrinks (never inflate).
+                    _k, _kt = self._try_ml_compressor(content, context, question)
+                    if (
+                        _k is not None
+                        and _kt is not None
+                        and _kt < original_tokens
+                        and len(_k) < len(content)
+                    ):
+                        compressed, compressed_tokens = _k, _kt
+                        strategy = CompressionStrategy.KOMPRESS
+                        actual_strategy = strategy
+                        compressor_name = "KompressCompressor"
+                        decision_reason = "code_aware_no_shrink_fallback_kompress"
+                        strategy_chain.append(CompressionStrategy.KOMPRESS.value)
 
             elif strategy == CompressionStrategy.SMART_CRUSHER:
                 # SmartCrusher handles its own TOIN recording
