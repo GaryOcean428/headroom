@@ -296,12 +296,17 @@ def overlay_cached_prefix(
     if len(current_original_messages) < n or len(optimized_messages) < n:
         return optimized_messages
     # Append-only guard on CONTENT ONLY: the frozen region must be the same
-    # messages we cached. Compare with cache_control stripped — clients move that
-    # breakpoint to the newest message each turn, so a raw dict compare would
-    # spuriously fail whenever a marker lands in the frozen prefix, skip the
-    # replay, and bust the cache (the residual busts observed after the first
-    # fix). Content stability is what the provider's prefix cache actually keys on.
-    if _strip_cache_control(current_original_messages[:n]) != _strip_cache_control(prev_orig):
+    # messages we cached. Compare with the shared canonicalizer (not just
+    # cache_control-stripping) so the guard is robust to ALL per-turn transport /
+    # annotation churn — cache_control movement (Anthropic), litellm `caller`,
+    # provider_specific_fields, streaming `index`, string<->block content shape,
+    # etc. — across providers/clients. Content stability is what the provider's
+    # prefix cache actually keys on; a coarser cache_control-only strip let other
+    # clients' noise spuriously fail the guard, skip the replay, and bust. This
+    # helps every handler that shares overlay_cached_prefix (Anthropic + OpenAI).
+    if _canonicalize_for_prefix_compare(
+        current_original_messages[:n]
+    ) != _canonicalize_for_prefix_compare(prev_orig):
         return optimized_messages
     # Replay the cached (compressed) prefix byte-identical; keep this turn's tail.
     return list(prev_fwd) + list(optimized_messages[n:])
