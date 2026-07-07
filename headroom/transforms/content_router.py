@@ -116,6 +116,30 @@ def _tool_call_command_text(raw: Any) -> str:
 _READ_VERBS = ("cat", "head", "tail", "nl", "bat", "less", "more")
 
 
+def _strip_cd_prefix(command: str) -> str:
+    """Peel leading ``cd <dir> &&|; `` chains from a shell command.
+
+    Agent harnesses (mini-swe-agent, Codex, Cursor, …) prefix nearly every command
+    with ``cd <repo> && `` (or ``cd <repo>; ``) to run in the checkout. Command-
+    classification helpers must strip this first, or the parsed program is ``cd``
+    instead of the real tool (``grep``/``cat``/…) — which silently disables read-
+    protection and the lossless search-fold (observed: 100% of ``cd … && rg``
+    output went uncompacted). Provider/harness-agnostic: operates on the plain
+    shell string that every client ultimately produces. Only ``&&`` and ``;``
+    connectors are peeled (a mis-parse is harmless — the caller falls through to
+    the normal path, guarded by downstream reversibility checks).
+    """
+    if not command or not isinstance(command, str):
+        return ""
+    c = command.strip()
+    while True:
+        m = re.match(r"^cd\s+[^&;|]+(?:&&|;)\s*(.*)$", c, re.S)
+        if not m:
+            break
+        c = m.group(1).strip()
+    return c
+
+
 def _is_read_command(command: str) -> bool:
     """True when a shell command's output is essentially raw FILE CONTENT the agent
     will read/edit from — ``cat``/``head``/``tail``/``nl``/``less``/``more`` of a file,
@@ -133,13 +157,8 @@ def _is_read_command(command: str) -> bool:
     """
     if not command or not isinstance(command, str):
         return False
-    c = command.strip()
     # strip leading `cd <dir> && ` chains (agents prefix reads with a cd)
-    while True:
-        m = re.match(r"^cd\s+[^&;|]+&&\s*(.*)$", c, re.S)
-        if not m:
-            break
-        c = m.group(1).strip()
+    c = _strip_cd_prefix(command)
     # a write / append / tee / heredoc anywhere => not a pure read
     if re.search(r"(^|\s)(>>?|tee\b|<<)", c):
         return False
@@ -203,6 +222,9 @@ def _bash_command_is_search(command: str, search_commands: frozenset[str]) -> bo
     """True when ``command`` is a read-only search whose output folds byte-
     losslessly (grep/rg/git grep/…). Peels wrappers and recurses into ``sh -c``.
     """
+    # Peel `cd <dir> && ` chains first — harnesses prefix every command with a
+    # cd, so without this the parsed program is `cd` and the fold never fires.
+    command = _strip_cd_prefix(command)
     prog, rest = _bash_program(command)
     if not prog:
         return False
@@ -3210,10 +3232,16 @@ class ContentRouter(Transform):
             "false",
             "no",
         ):
+            # Use _tool_call_commands (the parsed shell command), NOT
+            # _tool_call_args (a compact free-text blob that, for OpenAI-style
+            # JSON-string args, is the raw ``{"command": ...}`` JSON — on which
+            # _is_read_command always returns False, silently disabling read
+            # protection for OpenAI-native harnesses). _tool_call_commands is
+            # extracted via _tool_call_command_text, correct for both wire shapes.
             self._protect_read_tool_ids = {
                 tid
                 for tid in tool_name_map
-                if _is_read_command(self._tool_call_args.get(tid, ""))
+                if _is_read_command(self._tool_call_commands.get(tid, ""))
             }
 
         # --- Adaptive parameters based on context pressure ---

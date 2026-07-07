@@ -227,3 +227,61 @@ def test_read_command_classifier():
            "git diff -- f", "swebench-pytest-lite t/", "", None]
     assert all(_isread(c) for c in reads), [c for c in reads if not _isread(c)]
     assert not any(_isread(c) for c in non), [c for c in non if _isread(c)]
+
+
+# ============================================================================
+# Section 5 — command classification is harness-agnostic (Bug A + Bug B)
+# ============================================================================
+# Two bugs that silently disabled compression/protection on real harnesses.
+# These lock in the fixes and assert they hold across the command-prefix and
+# tool-call wire shapes different harnesses/providers emit.
+from headroom.transforms.content_router import (
+    _bash_command_is_search as _issearch,
+    _strip_cd_prefix as _stripcd,
+    _tool_call_command_text as _cmdtext,
+    _is_read_command as _isread2,
+)
+
+_SEARCH = frozenset({"grep", "rg", "ag", "fgrep", "egrep", "ripgrep"})
+
+
+def test_bugA_cd_prefixed_search_detected_all_harnesses():
+    # Harnesses run every command inside the checkout: `cd <repo> && <tool>`
+    # (mini-swe-agent, most) or `cd <repo>; <tool>` (some Codex configs). Before
+    # the fix, _bash_program read the program as `cd` -> search fold never fired.
+    for cmd in [
+        "cd /tmp/core && rg -l safe_math --type py",
+        "cd /tmp/core && grep -rn foo suma/",
+        "cd /repo; grep -n bar .",              # semicolon connector
+        "cd /a && cd b && rg pat",              # chained cds
+        "grep -rn x .",                          # no prefix (regression)
+        "rg pattern src/",
+    ]:
+        assert _issearch(cmd, _SEARCH), f"search not detected: {cmd!r}"
+    # non-search must stay non-search even with a cd prefix
+    for cmd in ["cd /x && cat a.py", "cd /x && python -c 'x'", "cd /x && ls -la"]:
+        assert not _issearch(cmd, _SEARCH), f"false search: {cmd!r}"
+
+
+def test_bugA_strip_cd_prefix_shapes():
+    assert _stripcd("cd /tmp/core && rg x") == "rg x"
+    assert _stripcd("cd /repo; grep x") == "grep x"
+    assert _stripcd("cd a && cd b && grep x") == "grep x"
+    assert _stripcd("grep x .") == "grep x ."          # nothing to strip
+    assert _stripcd("") == "" and _stripcd(None) == ""  # defensive
+
+
+def test_bugB_read_detection_across_tool_call_wire_shapes():
+    # The SAME read action, as each provider/harness serializes its tool call.
+    # _tool_call_command_text must recover the shell command from all of them so
+    # read-protection fires regardless of client. (Bug B: the old path fed the
+    # raw OpenAI JSON blob to _is_read_command, which always returned False.)
+    import json
+    anthropic_input = {"command": "cd /tmp/core && cat suma/x.py"}      # Anthropic: dict
+    openai_args = json.dumps({"command": "cd /tmp/core && cat suma/x.py"})  # OpenAI: JSON string
+    codex_list = {"command": ["cat", "suma/x.py"]}                       # Codex: argv list
+    for raw in (anthropic_input, openai_args, codex_list):
+        assert _isread2(_cmdtext(raw)), f"read not detected from {raw!r}"
+    # a search command from any shape must NOT be read-protected (stays compressible)
+    assert not _isread2(_cmdtext({"command": "cd /x && rg pat"}))
+    assert not _isread2(_cmdtext(json.dumps({"command": "grep -rn x ."})))
