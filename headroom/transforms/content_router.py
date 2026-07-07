@@ -113,6 +113,22 @@ def _tool_call_command_text(raw: Any) -> str:
     return cmd if isinstance(cmd, str) else ""
 
 
+def _fenced_shell_command(content: Any) -> str:
+    """Extract the shell command from a TEXT-BASED agent's fenced code block.
+
+    Text-based harnesses (mini-swe-agent backticks, Codex, Cursor, and any
+    non-native-tool OpenAI agent) put the command in a ```mswea_bash_command /
+    ```bash fenced block inside the assistant's *string* content — there is no
+    ``tool_use``/``tool_calls`` block. Returns the first fenced block's body, or
+    "" when there is none. Shape-agnostic input to read-detection so cat/sed
+    reads are protected on any model, not just those emitting tool-call blocks.
+    """
+    if not isinstance(content, str) or "```" not in content:
+        return ""
+    m = re.search(r"```(?:[\w.-]+)?[ \t]*\n(.*?)```", content, re.S)
+    return m.group(1).strip() if m else ""
+
+
 _READ_VERBS = ("cat", "head", "tail", "nl", "bat", "less", "more")
 
 
@@ -3249,6 +3265,35 @@ class ContentRouter(Transform):
                 if _is_read_command(self._tool_call_commands.get(tid, ""))
             }
 
+        # Read protection — TEXT-BASED shape (shape-agnostic twin of the above).
+        # Text-based agents (GPT-5.4/Codex/Cursor backticks) have no tool_use
+        # blocks: the command is in the PRECEDING assistant message's fenced
+        # block and the observation is a plain user string with no id to match.
+        # Detect the producing command by walking back to that assistant turn and
+        # mark the observation's message index so it is passed verbatim — so
+        # cat/sed/head code reads are protected on ANY model/harness, not just
+        # those that emit tool-call/tool_result blocks.
+        self._protect_read_msg_indices: set[int] = set()
+        if os.environ.get("HEADROOM_PROTECT_READS", "0").strip().lower() not in (
+            "0",
+            "",
+            "false",
+            "no",
+        ):
+            for _idx, _m in enumerate(messages):
+                if _m.get("role") != "user":
+                    continue
+                _cmd = ""
+                for _j in range(_idx - 1, -1, -1):
+                    _rj = messages[_j].get("role")
+                    if _rj == "assistant":
+                        _cmd = _fenced_shell_command(messages[_j].get("content"))
+                        break
+                    if _rj == "user":
+                        break
+                if _cmd and _is_read_command(_cmd):
+                    self._protect_read_msg_indices.add(_idx)
+
         # --- Adaptive parameters based on context pressure ---
         num_messages = len(messages)
         model_limit = kwargs.get("model_limit", 0)
@@ -3479,6 +3524,19 @@ class ContentRouter(Transform):
                         route_counts.get("bash_lossless_search", 0) + 1
                     )
                     continue
+
+            # Read protection (TEXT-BASED shape): this user observation was
+            # produced by a read command (cat/sed/head of a file) per the
+            # preceding assistant's fenced command — pass it VERBATIM so the agent
+            # keeps exact bytes to edit. Fires regardless of skip_user (protection
+            # is stricter than the compress-user toggle), mirroring the
+            # tool_result read-protection path for block-shaped clients.
+            if role == "user" and i in getattr(self, "_protect_read_msg_indices", ()):
+                result_slots[i] = message
+                transforms_applied.append("router:read_protected:text")
+                route_counts.setdefault("read_protected", 0)
+                route_counts["read_protected"] += 1
+                continue
 
             # Protection 1: Never compress user messages (unless overridden)
             if skip_user and role == "user":

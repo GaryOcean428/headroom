@@ -291,6 +291,41 @@ def test_openai_tool_calls_none_does_not_crash_and_still_compresses():
     assert isinstance(name_map, dict)
 
 
+def test_text_based_read_protection_shape_agnostic(monkeypatch=None):
+    # Text-based agents (GPT-5.4/Codex/Cursor) have NO tool_use/tool_result blocks:
+    # the command is a fenced block in the assistant STRING, the observation is a
+    # plain user string. Read-protection must still fire off the *preceding
+    # command* so cat/sed code reads are passed verbatim on ANY model/harness.
+    import os
+    from headroom.transforms.content_router import (
+        ContentRouter, ContentRouterConfig, _fenced_shell_command,
+    )
+    from headroom.transforms.read_lifecycle import ReadLifecycleConfig
+    from headroom.tokenizers.registry import get_tokenizer
+    assert _fenced_shell_command("T\n```mswea_bash_command\ncd /r && cat x.py\n```") == "cd /r && cat x.py"
+    assert _fenced_shell_command("no fence here") == ""
+    os.environ["HEADROOM_PROTECT_READS"] = "1"
+    tok = get_tokenizer("gpt-4o")
+    big_code = "def f():\n" + "    x = 1\n" * 300
+    msgs = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "task"},
+        {"role": "assistant", "content": "T\n```mswea_bash_command\ncd /r && cat a.py\n```",
+         "tool_calls": None},                                   # READ command
+        {"role": "user", "content": "<returncode>0</returncode>\n<output>\n" + big_code + "</output>"},
+        {"role": "assistant", "content": "T\n```mswea_bash_command\ncd /r && grep -rn foo .\n```",
+         "tool_calls": None},                                   # SEARCH command
+        {"role": "user", "content": "<returncode>0</returncode>\n<output>\n" + ("a.py:1:foo\n" * 300) + "</output>"},
+    ]
+    r = ContentRouter(ContentRouterConfig(skip_user_messages=False,
+                                          read_lifecycle=ReadLifecycleConfig(enabled=False)))
+    r.apply([dict(m) for m in msgs], tok, frozen_message_count=0, context="",
+            compress_user_messages=True, protect_recent=0, min_tokens_to_compress=25)
+    # the observation AFTER the cat (index 3) must be read-protected; the grep one (5) must not
+    assert 3 in r._protect_read_msg_indices, r._protect_read_msg_indices
+    assert 5 not in r._protect_read_msg_indices, r._protect_read_msg_indices
+
+
 def test_bugB_read_detection_across_tool_call_wire_shapes():
     # The SAME read action, as each provider/harness serializes its tool call.
     # _tool_call_command_text must recover the shell command from all of them so
