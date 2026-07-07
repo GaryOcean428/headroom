@@ -4054,12 +4054,44 @@ class ContentRouter(Transform):
 
                 tool_content = block.get("content", "")
 
+                # fix-7: OpenAI-style clients (litellm) send tool_result `content`
+                # as a LIST of text blocks ([{"type":"text","text": ...}]), not a
+                # bare string. Every check/compressor below is `isinstance(str)`-
+                # gated, so list-form tool outputs were skipped entirely (bucketed
+                # "small" -> 0% compression even on 10k-char reads). Flatten the
+                # text blocks to a string for the checks/compressors, and re-wrap
+                # the result in the SAME container on write-back so the on-wire
+                # shape is unchanged. Mixed / non-text content (e.g. images) does
+                # NOT flatten (tool_text stays the list) -> str checks fail ->
+                # block passes through unchanged, exactly as before.
+                _tr_list_form = (
+                    isinstance(tool_content, list)
+                    and bool(tool_content)
+                    and all(
+                        isinstance(b, dict) and b.get("type") == "text" for b in tool_content
+                    )
+                )
+                tool_text = (
+                    "".join(b.get("text", "") for b in tool_content)
+                    if _tr_list_form
+                    else tool_content
+                )
+
                 # Bash-search lossless pre-empt (twin of the string-form path):
                 # fold read-only search output (grep/rg/git grep) byte-losslessly
                 # instead of taking the lossy strategy path.
-                bash_folded = self._bash_search_fold(tool_name, tool_use_id, tool_content)
+                bash_folded = self._bash_search_fold(tool_name, tool_use_id, tool_text)
                 if bash_folded is not None:
-                    new_blocks.append({**block, "content": bash_folded})
+                    new_blocks.append(
+                        {
+                            **block,
+                            "content": (
+                                [{"type": "text", "text": bash_folded}]
+                                if _tr_list_form
+                                else bash_folded
+                            ),
+                        }
+                    )
                     transforms_applied.append("router:bash:lossless_search")
                     if route_counts is not None:
                         route_counts["bash_lossless_search"] = (
@@ -4077,11 +4109,11 @@ class ContentRouter(Transform):
                 # error lines in big logs.
                 if (
                     self.config.protect_error_outputs
-                    and isinstance(tool_content, str)
-                    and len(tool_content) <= self.config.error_protection_max_chars
+                    and isinstance(tool_text, str)
+                    and len(tool_text) <= self.config.error_protection_max_chars
                     and (
                         block.get("is_error") is True
-                        or content_has_strong_error_indicators(tool_content)
+                        or content_has_strong_error_indicators(tool_text)
                     )
                 ):
                     new_blocks.append(block)
@@ -4094,13 +4126,13 @@ class ContentRouter(Transform):
                 # Only process string content. Blocks below the lossy min_chars
                 # floor still pass when a byte-lossless fold shrinks them — the
                 # floor guards the lossy path only; lossless has no size floor.
-                if isinstance(tool_content, str) and (
-                    len(tool_content) > min_chars or self._has_lossless_fold(tool_content)
+                if isinstance(tool_text, str) and (
+                    len(tool_text) > min_chars or self._has_lossless_fold(tool_text)
                 ):
                     # Compression pinning: skip already-compressed content
                     if (
-                        "Retrieve more: hash=" in tool_content
-                        or "Retrieve original: hash=" in tool_content
+                        "Retrieve more: hash=" in tool_text
+                        or "Retrieve original: hash=" in tool_text
                     ):
                         new_blocks.append(block)
                         if route_counts is not None:
@@ -4110,9 +4142,9 @@ class ContentRouter(Transform):
 
                     # Two-tier compression cache → shared helper
                     compressed_content, was_compressed = self._compress_block_content(
-                        content=tool_content,
+                        content=tool_text,
                         content_key=hash(
-                            (tool_content, getattr(self, "_runtime_target_ratio", None))
+                            (tool_text, getattr(self, "_runtime_target_ratio", None))
                         ),
                         context=block_context,
                         bias=bias,
@@ -4126,14 +4158,41 @@ class ContentRouter(Transform):
                         enforce_reversibility=True,
                     )
                     if compressed_content is not None:
-                        new_blocks.append({**block, "content": compressed_content})
+                        new_blocks.append(
+                            {
+                                **block,
+                                "content": (
+                                    [{"type": "text", "text": compressed_content}]
+                                    if _tr_list_form
+                                    else compressed_content
+                                ),
+                            }
+                        )
                         any_compressed = True
+                        if _tr_list_form:
+                            import sys as _sys
+
+                            print(
+                                f"[FIX7-DIAG] compressed list-form tool_result: "
+                                f"len_before={len(tool_text)}",
+                                file=_sys.stderr,
+                                flush=True,
+                            )
                     else:
                         new_blocks.append(block)
                     continue
                 else:
                     if route_counts is not None:
                         route_counts["small"] += 1
+                    import sys as _sys
+
+                    print(
+                        f"[FIX7-DIAG] small tool_result: list_form={_tr_list_form} "
+                        f"text_type={type(tool_text).__name__} "
+                        f"len={len(tool_text) if isinstance(tool_text, str) else 'n/a'}",
+                        file=_sys.stderr,
+                        flush=True,
+                    )
 
             # Handle text blocks — compress for non-Anthropic clients (e.g.
             # OpenAI/DeepSeek via Cline) whose SDK normalizes content to

@@ -332,17 +332,42 @@ class AnthropicHandlerMixin:
         replay the byte-identical cached prefix AND compress only the appended
         delta. Mirrors the guard already used by ``overlay_cached_prefix``.
         """
-        from headroom.cache.prefix_tracker import _strip_cache_control
+        from headroom.cache.prefix_tracker import _canonicalize_for_prefix_compare
+        import sys as _sys
+
+        def _diag(msg: str) -> None:  # TEMP delta-path diagnostics -> proxy.log
+            print(f"[DELTA-DIAG] {msg}", file=_sys.stderr, flush=True)
 
         if not previous_original_messages or previous_forwarded_messages is None:
+            _diag(
+                f"None:cold prev_orig={bool(previous_original_messages)} "
+                f"prev_fwd={previous_forwarded_messages is not None}"
+            )
             return None
         prefix_len = len(previous_original_messages)
         if len(current_messages) < prefix_len:
+            _diag(f"None:shorter cur={len(current_messages)} < prefix_len={prefix_len}")
             return None
-        if _strip_cache_control(current_messages[:prefix_len]) != _strip_cache_control(
-            previous_original_messages
-        ):
+        _cs = _canonicalize_for_prefix_compare(current_messages[:prefix_len])
+        _ps = _canonicalize_for_prefix_compare(previous_original_messages)
+        if _cs != _ps:
+            _di = next((k for k in range(min(len(_cs), len(_ps))) if _cs[k] != _ps[k]), -1)
+            if _di >= 0:
+                _c, _p = _cs[_di], _ps[_di]
+                _ck = sorted(_c.keys()) if isinstance(_c, dict) else str(type(_c))
+                _pk = sorted(_p.keys()) if isinstance(_p, dict) else str(type(_p))
+                _diag(
+                    f"None:MISMATCH idx={_di}/{prefix_len} "
+                    f"cur_role={_c.get('role') if isinstance(_c, dict) else '?'} "
+                    f"prv_role={_p.get('role') if isinstance(_p, dict) else '?'} "
+                    f"cur_keys={_ck} prv_keys={_pk}"
+                )
+                _diag(f"  cur[{_di}]={repr(_c)[:500]}")
+                _diag(f"  prv[{_di}]={repr(_p)[:500]}")
+            else:
+                _diag(f"None:length-only cur_len={len(_cs)} prv_len={len(_ps)}")
             return None
+        _diag(f"ENGAGED prefix_len={prefix_len} delta={len(current_messages) - prefix_len}")
         return (
             copy.deepcopy(previous_forwarded_messages),
             copy.deepcopy(current_messages[prefix_len:]),
@@ -1312,13 +1337,52 @@ class AnthropicHandlerMixin:
                                     optimized_messages = messages
                                     optimized_tokens = tokenizer.count_messages(optimized_messages)
                                 else:
+                                    # Compress the delta, with two cache-mode adjustments:
+                                    #
+                                    # fix-5: strip the client's transient cache_control marker so
+                                    #   the router's per-block "never compress an explicit cache
+                                    #   key" guard (content_router.py:4006) doesn't skip the ONLY
+                                    #   compressible content every turn (route_counts had
+                                    #   cache_control_protected == the whole delta -> 0%). In cache
+                                    #   mode that marker is NOT the real forwarded breakpoint: the
+                                    #   compressed delta is frozen + replayed verbatim next turn and
+                                    #   normalize_message_cache_control (AFTER compression, below)
+                                    #   owns the single forwarded breakpoint. Cache-safety is
+                                    #   enforced post-compression, not by protecting the delta.
+                                    #
+                                    # fix-6: the delta is a lone tool_result whose tool_use (tool
+                                    #   NAME + call args) lives in the frozen prefix. Passing only
+                                    #   the delta to the router leaves tool_name="" so
+                                    #   _bash_search_fold (lossless grep/rg folding, no size floor),
+                                    #   per-tool bias, and relevance-query enrichment all degrade.
+                                    #   Pass the FULL current messages with frozen_message_count =
+                                    #   prefix length: _build_tool_name_map scans ALL messages (the
+                                    #   delta resolves its tool_name from the prefix's tool_use) but
+                                    #   the compression loop only touches indices >= frozen count,
+                                    #   so ONLY the delta is compressed. Splice the compressed delta
+                                    #   onto the byte-stable forwarded prefix.
+                                    from headroom.cache.prefix_tracker import _strip_cache_control
+
+                                    # Compression context = the EXACT forwarded (cached) prefix
+                                    # + the stripped delta, with the prefix frozen. Using the
+                                    # forwarded prefix (not the original) keeps _build_tool_name_map
+                                    # AND cross-turn dedup consistent with what is actually cached:
+                                    # dedup can only reference bytes that are truly present in the
+                                    # forwarded context, so no pointer can dangle. The prefix is
+                                    # frozen (never compressed) and we discard the router's copy of
+                                    # it below, so the forwarded prefix stays byte-identical to last
+                                    # turn -> append-only -> no bust.
+                                    prefix_n = len(stable_forwarded_prefix)
+                                    compression_input = list(stable_forwarded_prefix) + list(
+                                        _strip_cache_control(delta_messages)
+                                    )
                                     result = await self._run_compression_in_executor(
                                         lambda: self.anthropic_pipeline.apply(
-                                            messages=delta_messages,
+                                            messages=compression_input,
                                             model=model,
                                             model_limit=context_limit,
-                                            context=extract_user_query(delta_messages),
-                                            frozen_message_count=0,
+                                            context=extract_user_query(compression_input),
+                                            frozen_message_count=prefix_n,
                                             biases=biases,
                                             request_id=request_id,
                                             compression_policy=compression_policy,
@@ -1326,7 +1390,10 @@ class AnthropicHandlerMixin:
                                         ),
                                         timeout=COMPRESSION_TIMEOUT_SECONDS,
                                     )
-                                    optimized_messages = stable_forwarded_prefix + result.messages
+                                    # Only the delta was eligible for compression (prefix frozen);
+                                    # forward the byte-identical cached prefix + the compressed delta.
+                                    compressed_delta = result.messages[prefix_n:]
+                                    optimized_messages = stable_forwarded_prefix + compressed_delta
                                     transforms_applied = result.transforms_applied
                                     pipeline_timing = result.timing
                                     optimized_tokens = tokenizer.count_messages(optimized_messages)

@@ -128,6 +128,49 @@ def _strip_cache_control(obj: Any) -> Any:
     return obj
 
 
+def _canonicalize_for_prefix_compare(obj: Any) -> Any:
+    """Representation-agnostic canonical form for cross-turn prefix equality.
+
+    Anthropic accepts several *equivalent* encodings for the same message, and
+    real clients vary them turn-to-turn. A raw-dict prefix compare then fails
+    spuriously and drops cache mode to raw (uncompressed) forwarding. The two
+    observed shape variances:
+
+      * ``cache_control`` is moved to the newest message every turn (clients like
+        litellm / Claude Code mark only the latest block).
+      * ``content`` may be a bare string OR ``[{"type": "text", "text": ...}]``.
+        litellm resends tool_result / text content as a plain string while the
+        stored ``previous_original`` holds the block-list form (or vice-versa),
+        so the very first tool_result mismatches on shape every turn.
+      * client-only annotation keys (e.g. ``caller`` on a ``tool_use`` block, a
+        mini-swe-agent / litellm routing tag) appear on the stored copy but not on
+        the re-sent wire message (or vice-versa), mismatching every assistant turn.
+
+    This normalizes ONLY representation: it drops non-semantic annotation keys and
+    wraps any string ``content`` into a single text block. It never drops, reorders,
+    or merges actual message text / tool inputs, so two messages canonicalize-equal
+    iff their semantic content is identical -- safe to then replay the
+    previously-forwarded (provider-cached) bytes.
+    """
+    # Keys that carry no semantic payload for the model — they are transport /
+    # caching / client-routing annotations that clients vary between turns. They
+    # must be ignored when deciding whether this turn append-only-extends the last.
+    _NON_SEMANTIC_KEYS = ("cache_control", "caller")
+    if isinstance(obj, dict):
+        out: dict[str, Any] = {}
+        for key, value in obj.items():
+            if key in _NON_SEMANTIC_KEYS:
+                continue
+            if key == "content" and isinstance(value, str):
+                out[key] = [{"type": "text", "text": value}]
+            else:
+                out[key] = _canonicalize_for_prefix_compare(value)
+        return out
+    if isinstance(obj, list):
+        return [_canonicalize_for_prefix_compare(value) for value in obj]
+    return obj
+
+
 def overlay_cached_prefix(
     optimized_messages: list[dict[str, Any]],
     current_original_messages: list[dict[str, Any]],
