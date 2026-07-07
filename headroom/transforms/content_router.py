@@ -4169,30 +4169,12 @@ class ContentRouter(Transform):
                             }
                         )
                         any_compressed = True
-                        if _tr_list_form:
-                            import sys as _sys
-
-                            print(
-                                f"[FIX7-DIAG] compressed list-form tool_result: "
-                                f"len_before={len(tool_text)}",
-                                file=_sys.stderr,
-                                flush=True,
-                            )
                     else:
                         new_blocks.append(block)
                     continue
                 else:
                     if route_counts is not None:
                         route_counts["small"] += 1
-                    import sys as _sys
-
-                    print(
-                        f"[FIX7-DIAG] small tool_result: list_form={_tr_list_form} "
-                        f"text_type={type(tool_text).__name__} "
-                        f"len={len(tool_text) if isinstance(tool_text, str) else 'n/a'}",
-                        file=_sys.stderr,
-                        flush=True,
-                    )
 
             # Handle text blocks — compress for non-Anthropic clients (e.g.
             # OpenAI/DeepSeek via Cline) whose SDK normalizes content to
