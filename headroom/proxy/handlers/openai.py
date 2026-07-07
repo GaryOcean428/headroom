@@ -2996,10 +2996,23 @@ class OpenAIHandlerMixin:
                 # OpenAI has no write penalty — uncached = total - cached
                 uncached_input_tokens = max(0, total_input_tokens - cache_read_tokens)
 
+                # Report POST-GUARD savings only. The forwarded request is never
+                # larger than the original (inflation is reverted at the guard
+                # above, and confirmed clean on the wire), so compression savings
+                # are >= 0 by construction. A negative `tokens_saved` here is an
+                # intermediate/hook token-count artifact that never reached the
+                # model — clamp it so stats reflect the actually-forwarded bytes
+                # (was surfacing as spurious negative `total_tokens_removed`).
+                reported_tokens_saved = max(0, tokens_saved)
+                if tokens_saved < 0:
+                    logger.debug(
+                        "[%s] pre-guard tokens_saved=%d clamped to 0 (wire not inflated)",
+                        request_id, tokens_saved,
+                    )
                 if self.cost_tracker:
                     self.cost_tracker.record_tokens(
                         model,
-                        tokens_saved,
+                        reported_tokens_saved,
                         optimized_tokens,
                         cache_read_tokens=cache_read_tokens,
                         cache_write_tokens=cache_write_tokens,
@@ -3919,9 +3932,18 @@ class OpenAIHandlerMixin:
                         cache_read_tokens,
                     )
                     uncached_input_tokens = max(0, total_input_tokens - cache_read_tokens)
+                    # Post-guard clamp (see primary record_tokens site above): the
+                    # wire is never inflated, so a negative here is an accounting
+                    # artifact — report the actually-forwarded savings.
+                    reported_tokens_saved = max(0, tokens_saved)
+                    if tokens_saved < 0:
+                        logger.debug(
+                            "[%s] pre-guard tokens_saved=%d clamped to 0 (wire not inflated)",
+                            request_id, tokens_saved,
+                        )
                     self.cost_tracker.record_tokens(
                         model,
-                        tokens_saved,
+                        reported_tokens_saved,
                         total_input_tokens,
                         cache_read_tokens=cache_read_tokens,
                         cache_write_tokens=cache_write_tokens,
